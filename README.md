@@ -2,9 +2,9 @@ you can use ip
 
 install:
 
-git clone
+git clone https://github.com/prilyawen/firewall_analyzer.git
 
-cd ~/firewall_policy_analyzer
+cd ~/firewall_analyzer
 
 python3.11 -m venv myenv 
 
