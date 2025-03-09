@@ -1,0 +1,382 @@
+# -*- coding: utf-8 -*-
+
+"""
+Copyright 2022-2025 Maen Artimy
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+from io import StringIO
+import pandas as pd
+import streamlit as st
+import re
+import plotly.graph_objects as go
+from policyanalyzer import Policy, PolicyAnalyzer, Packet
+
+EXAMPE_RULES = """
+protocol,src,s_port,dst,d_port,action
+tcp,140.192.37.20,any,0.0.0.0/0,HTTP,deny
+tcp,140.192.37.0/24,any,0.0.0.0/0,"HTTP, HTTPS",accept
+tcp,0.0.0.0/0,any,161.120.33.40,80,accept
+tcp,140.192.37.0/24,any,161.120.33.40,80,deny
+tcp,140.192.37.30,any,0.0.0.0/0,21,deny
+tcp,140.192.37.0/24,any,0.0.0.0/0,21,accept
+tcp,140.192.37.0/24,any,161.120.33.40,21,accept
+tcp,0.0.0.0/0,any,0.0.0.0/0,any,deny
+udp,140.192.37.0/24,any,161.120.33.40,DNS,accept
+udp,0.0.0.0/0,any,161.120.33.40,53,accept
+udp,140.192.38.0/24,any,161.120.35.0/24,any,accept
+udp,0.0.0.0/0,any,0.0.0.0/0,any,deny
+"""
+
+DEF_GEN = """A rule (Y) is a generalization of a preceding rule (X) if they have different actions, and if rule (Y) can match all the packets that match rule (X)."""
+DEF_RXD = """A rule (X) is redundant if it performs the same action on the same packets as a following rule (Y), and if rule (Y) can match all the packets that match rule (X), except when there is an intermediate rule (Z) that relates to (X) but with different action."""
+DEF_RYD = """A rule (Y) is redundant if it performs the same action on the same packets as a preceding rule (X), and if rule (X) can match all the packets that match rule (Y)."""
+DEF_SHD = """A rule (Y) is shadowed by a previous rule (X) if they have different actions, and if rule (X) matches all the packets that match rule (Y), such that the rule (Y) will never be reached."""
+DEF_COR = """Two rules (X) and (Y) are correlated if they have different actions, and rule (X) matches some packets that match rule (Y) and rule (Y) matches some packets that match rule (X)."""
+
+desc = {
+    "GEN": {"short": "Generalization", "long": "generalizes", "rec": "No change is required.", "def": DEF_GEN},
+    "SHD": {"short": "Shadowing", "long": "is shadowed by", "rec": "Move rule Y before X.", "def": DEF_SHD},
+    "COR": {"short": "Correlation", "long": "correlates with", "rec": "Verify correctness by studying the effect of flipping the order of the two rules.", "def": DEF_COR},
+    "RXD": {"short": "Redundancy X", "long": "is a superset of", "rec": "Remove rule X.", "def": DEF_RXD},
+    "RYD": {"short": "Redundancy Y", "long": "is a subset of", "rec": "Remove rule Y", "def": DEF_RYD},
+}
+
+TITLE = "Firewall Policy Analyzer"
+ABOUT = """This app analyzes a set of firewall policies and detects common patterns and conflicts. Supports CSV uploads and iptables output.\n:warning: This is work in progress. Use at your own risk. :warning:"""
+NO_RELATION = ":heavy_check_mark: No anomalies detected."
+EXAMPLE_HELP = "Use built-in example file to demo the app."
+SELECT_RULES = "Select rules to review relationships."
+UPLOAD_FILE = "Upload a file or paste iptables output"
+
+errors = ["SHD", "RYD", "RXD"]
+warn = ["COR"]
+
+def color_erros(val):
+    fcolor = "red" if val in errors else "orange" if val in warn else None
+    style = f"color: {fcolor};" if fcolor else ""
+    return style
+
+def to_dict(rel_dict):
+    my_dict = {}
+    for r_item in rel_dict:
+        sub_dict = {i[0]: str(i[1]) for i in rel_dict[r_item]}
+        my_dict[r_item] = sub_dict
+    return my_dict
+
+def convert_df(data_frame):
+    return data_frame.to_csv(index=False).encode("utf-8")
+
+def move_row(df, from_idx, to_idx, position):
+    df = df.copy()
+    row = df.iloc[from_idx]
+    df = df.drop(index=from_idx).reset_index(drop=True)
+    if position == "before":
+        df_top = df.iloc[:to_idx]
+        df_bottom = df.iloc[to_idx:]
+        df = pd.concat([df_top, pd.DataFrame([row]), df_bottom]).reset_index(drop=True)
+    else:
+        df_top = df.iloc[:to_idx + 1]
+        df_bottom = df.iloc[to_idx + 1:]
+        df = pd.concat([df_top, pd.DataFrame([row]), df_bottom]).reset_index(drop=True)
+    return df
+
+def format_csv(csv_content):
+    df = pd.read_csv(StringIO(csv_content))
+    required_columns = ["protocol", "src", "s_port", "dst", "d_port", "action"]
+    warnings = []
+    
+    for col in required_columns:
+        if col not in df.columns:
+            df[col] = "ANY" if col in ["s_port", "d_port"] else "0.0.0.0/0" if col in ["src", "dst"] else "TCP" if col == "protocol" else "deny"
+            warnings.append(f"Missing column '{col}' added with default value.")
+    
+    st.write("Formatted DataFrame:", df)
+    
+    valid_protocols = {"IP", "ICMP", "TCP", "UDP"}
+    valid_actions = {"accept", "deny", "permit", "allow", "pass", "reject", "drop"}
+    
+    for i, row in df.iterrows():
+        proto = str(row["protocol"]).upper()
+        if proto not in valid_protocols:
+            warnings.append(f"Row {i}: Invalid protocol '{proto}', changed to 'TCP'")
+            df.at[i, "protocol"] = "TCP"
+        else:
+            df.at[i, "protocol"] = proto
+        
+        for field in ["src", "dst"]:
+            val = str(row[field]).lower()
+            if val == "any":
+                df.at[i, field] = "0.0.0.0/0"
+            else:
+                df.at[i, field] = val
+        
+        for field in ["s_port", "d_port"]:
+            val = str(row[field]).upper()
+            if val.lower() == "any":
+                df.at[i, field] = "ANY"
+            else:
+                df.at[i, field] = val
+        
+        action = str(row["action"]).lower()
+        if action not in valid_actions:
+            warnings.append(f"Row {i}: Invalid action '{action}', changed to 'deny'")
+            df.at[i, "action"] = "deny"
+        elif action in ["permit", "allow", "pass"]:
+            df.at[i, "action"] = "accept"
+        elif action in ["reject", "drop"]:
+            df.at[i, "action"] = "deny"
+        else:
+            df.at[i, "action"] = action
+    
+    if warnings:
+        st.warning("CSV Formatting Warnings:\n" + "\n".join(warnings))
+    return df.to_csv(index=False)
+
+def parse_iptables_to_csv(iptables_output):
+    rules = []
+    current_chain = None
+    chain_policy = {}
+    valid_targets = {"ACCEPT", "DROP", "REJECT"}
+    
+    lines = iptables_output.strip().split("\n")
+    rule_pattern = re.compile(
+        r"^\s*(\d+)\s+.*?\s+(ACCEPT|DROP|REJECT)\s+"
+        r"(\w+)\s+--\s+(\S+)\s+(\S+)\s+"
+        r"(\d+\.\d+\.\d+\.\d+/\d+|\S+)\s+"
+        r"(\d+\.\d+\.\d+\.\d+/\d+|\S+)\s*(.*)$"
+    )
+    
+    for line in lines:
+        if line.startswith("Chain"):
+            match = re.match(r"Chain (\S+) \(policy (\S+)", line)
+            if match:
+                chain_name, policy = match.groups()
+                current_chain = chain_name
+                chain_policy[chain_name] = policy.lower()
+            continue
+        
+        if "num" in line or "pkts" in line:
+            continue
+        
+        match = rule_pattern.match(line)
+        if match:
+            num, target, protocol, in_iface, out_iface, src, dst, extra = match.groups()
+            s_port = "ANY"
+            d_port = "ANY"
+            if "spt:" in extra:
+                s_port = re.search(r"spt:(\d+)", extra).group(1)
+            if "dpt:" in extra:
+                d_port = re.search(r"dpt:(\d+)", extra).group(1)
+            protocol = "IP" if protocol == "all" else protocol.upper()
+            action = "accept" if target == "ACCEPT" else "deny" if target in ["DROP", "REJECT"] else None
+            
+            if action:
+                rules.append({
+                    "protocol": protocol,
+                    "src": src,
+                    "s_port": s_port,
+                    "dst": dst,
+                    "d_port": d_port,
+                    "action": action
+                })
+    
+    for chain, policy in chain_policy.items():
+        if chain in ["INPUT", "FORWARD"]:
+            rules.append({
+                "protocol": "IP",
+                "src": "0.0.0.0/0",
+                "s_port": "ANY",
+                "dst": "0.0.0.0/0",
+                "d_port": "ANY",
+                "action": "accept" if policy == "ACCEPT" else "deny"
+            })
+    
+    df = pd.DataFrame(rules)
+    st.write("Parsed iptables DataFrame:", df)
+    return df.to_csv(index=False)
+
+def visualize_rules(reader, anom_dict):
+    edges = [(x, y, anom_dict[y][x]) for y in anom_dict for x in anom_dict[y]]
+    labels = [f"Rule {i}: {row['protocol']} {row['src']}:{row['s_port']} -> {row['dst']}:{row['d_port']} ({row['action']})" for i, row in reader.iterrows()]
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(pad=15, thickness=20, line=dict(color="black", width=0.5), label=labels, color="blue"),
+        link=dict(source=[e[0] for e in edges], target=[e[1] for e in edges], value=[1 for _ in edges], label=[e[2] for e in edges], color="gray")
+    )])
+    fig.update_layout(title_text="Firewall Rules Relationship Flow", font_size=10)
+    return fig
+
+# Start the app
+st.set_page_config(layout="wide")
+st.title(TITLE)
+with st.expander("About", expanded=False):
+    st.markdown(ABOUT)
+
+try:
+    input_type = st.sidebar.radio("Input Type", ["Upload CSV", "Paste iptables Output"])
+    
+    if input_type == "Upload CSV":
+        rules_file = st.sidebar.file_uploader("Upload rules file", type="csv")
+        if rules_file is not None:
+            csv_content = rules_file.getvalue().decode("utf-8")
+            formatted_csv = format_csv(csv_content)
+            reader = pd.read_csv(StringIO(formatted_csv))
+    else:
+        iptables_text = st.sidebar.text_area("Paste iptables output here", height=200)
+        if iptables_text:
+            formatted_csv = parse_iptables_to_csv(iptables_text)
+            reader = pd.read_csv(StringIO(formatted_csv))
+    
+    o1, o2 = st.columns(2)
+    with o1:
+        show_ex = 'reader' in locals()
+        use_example = st.checkbox("Use example file", value=False, disabled=show_ex, help=EXAMPLE_HELP)
+        if use_example:
+            formatted_csv = format_csv(EXAMPE_RULES)
+            reader = pd.read_csv(StringIO(formatted_csv))
+    with o2:
+        show_ed = "edited" not in st.session_state
+        use_edited = st.checkbox("Use edited rules", value=False, disabled=show_ed)
+        if use_edited and "edited" in st.session_state:
+            reader = pd.read_csv(StringIO(st.session_state["edited"]))
+
+    if 'reader' in locals():
+        with st.expander("Rules"):
+            edited_reader = st.data_editor(reader, num_rows="dynamic", use_container_width=True, key="rules_editor")
+            if not edited_reader.equals(reader):
+                reader = edited_reader
+                st.session_state["edited"] = convert_df(reader).decode("utf-8")
+                st.rerun()
+            
+            f1, f2, f3 = st.columns(3)
+            from_idx = f1.selectbox("Select row index to move", options=range(len(reader)))
+            position = f2.selectbox("Move row", options=["before", "after"])
+            to_idx = f3.selectbox("Select destination row index", options=range(len(reader)))
+            if st.button("Move Row"):
+                reader = move_row(reader, from_idx, to_idx, position)
+                st.session_state["edited"] = convert_df(reader).decode("utf-8")
+                st.rerun()
+        
+        if use_edited and "edited" in st.session_state:
+            csv = convert_df(reader)
+            st.download_button(label="Download rules", data=csv, file_name="new_rules.csv", mime="text/csv")
+        
+        rules = [{key: str(value) for key, value in row.items()} for row in reader.to_dict(orient="records")]
+        policies = [Policy(**r) for r in rules]
+        analyzer = PolicyAnalyzer(policies)
+        anom = analyzer.get_anomalies()
+        anom_dict = to_dict(anom)
+        
+        relations = {}
+        for y_rule, y_dict in anom_dict.items():
+            col = [None] * len(rules)
+            for x_rule in y_dict:
+                col[x_rule] = y_dict[x_rule]
+            relations[y_rule] = col
+        
+        pdr = pd.DataFrame.from_dict(relations).transpose().dropna(axis=1, how="all").fillna("")
+        
+        st.header("Rule Flow Visualization")
+        st.plotly_chart(visualize_rules(reader, anom_dict), use_container_width=True)
+        
+        st.header("Summary")
+        if not pdr.empty:
+            st.write("Relationship count:")
+            count = {k: pdr[pdr == k].count().sum() for k in desc}
+            c1, c2, c3, c4, c5 = st.columns(5)
+            with c1: st.metric("SHD", count["SHD"], help=desc["SHD"]["short"])
+            with c2: st.metric("RXD", count["RXD"], help=desc["RXD"]["short"])
+            with c3: st.metric("RYD", count["RYD"], help=desc["RYD"]["short"])
+            with c4: st.metric("COR", count["COR"], help=desc["COR"]["short"])
+            with c5: st.metric("GEN", count["GEN"], help=desc["GEN"]["short"])
+            
+            st.write("Relationship table:")
+            hide_gen = st.checkbox("Ignore Generalizations", value=False)
+            if hide_gen:
+                pdr = pdr.map(lambda x: x.replace("GEN", ""))
+            st.dataframe(pdr.style.map(color_erros), use_container_width=True)
+        else:
+            st.markdown(NO_RELATION)
+        
+        st.header("Analysis")
+        if len(anom_dict) > 0:
+            st.write(SELECT_RULES)
+            col1, col2 = st.columns(2)
+            with col1:
+                y_rule = st.selectbox("Select Y Rule:", list(anom_dict.keys()))
+            with col2:
+                x_list = list(anom_dict[y_rule].keys())
+                x_rule = st.selectbox("Select X Rule", x_list)
+            
+            if y_rule:
+                st.dataframe(reader.iloc[[x_rule, y_rule]].rename(index={x_rule: f"X ({x_rule})", y_rule: f"Y ({y_rule})"}), use_container_width=True)
+                acode = anom_dict[y_rule][x_rule]
+                xy_rel = desc[acode]["long"]
+                xy_short = desc[acode]["short"]
+                xy_def = desc[acode]["def"]
+                xy_desc = f"Rule **Y** ({y_rule}) {xy_rel} rule **X** ({x_rule})."
+                xy_recom = desc[acode]["rec"]
+                
+                st.markdown(f"#### {xy_short}")
+                st.markdown(xy_desc)
+                with st.expander("Definition", expanded=False):
+                    st.markdown(xy_def)
+                st.markdown("#### Recommendation")
+                st.markdown(xy_recom)
+                
+                if acode in errors or acode in warn:
+                    placeholder = st.empty()
+                    apply = placeholder.button("Apply Recommendation", key=1)
+                    if apply:
+                        placeholder.empty()
+                        if not use_edited:
+                            placeholder.markdown("Check 'Use Edited Rules' box above to update the rules.")
+                        rules_list = reader.values.tolist()
+                        if acode == "SHD":
+                            rules_list.insert(x_rule, rules_list[y_rule])
+                            del rules_list[y_rule + 1]
+                        elif acode == "RXD":
+                            del rules_list[x_rule]
+                        elif acode == "RYD":
+                            del rules_list[y_rule]
+                        elif acode == "COR":
+                            rules_list[x_rule], rules_list[y_rule] = rules_list[y_rule], rules_list[x_rule]
+                        newdf = pd.DataFrame(rules_list, columns=reader.columns)
+                        csv = convert_df(newdf)
+                        st.session_state["edited"] = csv.decode("utf-8")
+                        st.rerun()
+        else:
+            st.markdown(NO_RELATION)
+        
+        st.header("Packet Simulation")
+        with st.form("packet_sim"):
+            proto = st.selectbox("Protocol", ["TCP", "UDP", "IP", "ICMP"])
+            src = st.text_input("Source IP", "0.0.0.0/0")
+            s_port = st.text_input("Source Port", "ANY")
+            dst = st.text_input("Destination IP", "0.0.0.0/0")
+            d_port = st.text_input("Destination Port", "ANY")
+            submit = st.form_submit_button("Simulate")
+            if submit:
+                packet = Packet(proto, src, s_port, dst, d_port)
+                match = analyzer.get_first_match(packet)
+                if match:
+                    rule_num, rule_action = match
+                    st.write(f"Result: Matched Rule {rule_num} ({str(rule_action)})")
+                else:
+                    st.write("Result: No match")
+    
+    else:
+        st.warning(UPLOAD_FILE)
+except Exception as e:
+    st.exception(e)
